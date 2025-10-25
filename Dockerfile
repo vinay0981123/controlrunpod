@@ -1,52 +1,42 @@
-# Base image
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# Base image (CUDA 12.3 + cuDNN 9 runtime)
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 
-# Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Update & install dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    sudo \
-    openssh-server \
-    curl \
-    git \
-    ca-certificates \
-    build-essential \
-    libssl-dev \
-    zlib1g-dev \
-    libbz2-dev \
-    libreadline-dev \
-    libsqlite3-dev \
-    wget \
-    llvm \
-    libncursesw5-dev \
-    xz-utils \
-    tk-dev \
-    libxml2-dev \
-    libxmlsec1-dev \
-    libffi-dev \
-    liblzma-dev \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+# Cache dirs for HF/Torch (optional but useful)
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/workspace/.cache/huggingface/transformers
+ENV HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface/hub
+ENV TORCH_HOME=/workspace/.cache/torch
 
-# Install Python 3.10.12
+# Install Python + runtime deps (single layer)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-venv python3.10-dev python3-pip \
+    python3.10 python3.10-venv python3-pip \
+    sudo openssh-server curl git ca-certificates ffmpeg wget \
+    libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+    libncursesw5-dev libffi-dev liblzma-dev libxml2-dev libxmlsec1-dev \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.10 /usr/bin/python3 \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
 
-# Set up SSH
+# Create cache dirs (so HF/Torch have writable paths when volume mounts)
+RUN mkdir -p /workspace/.cache/huggingface /workspace/.cache/torch /workspace/hearmefinal/logs
+
+# SSH setup (root password; you should use keys in production)
 RUN mkdir /var/run/sshd \
     && echo 'root:root' | chpasswd \
     && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
     && sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd
 
-# Optional: add a non-root user (safer than using root)
-RUN useradd -m -s /bin/bash user && echo 'user:user' | chpasswd && adduser user sudo
+# Add a safer non-root user (optional)
+RUN useradd -m -s /bin/bash user && echo 'user:user' | chpasswd && adduser user sudo || true
 
-# Expose SSH port
+# Copy entrypoint and make executable
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Expose ssh port
 EXPOSE 22
 
-# Start SSH when container runs
-CMD ["/usr/sbin/sshd", "-D"]
+# Entrypoint will start sshd, wait for /workspace/hearmefinal and run ./run.sh inside venv
+ENTRYPOINT [ "/usr/local/bin/entrypoint.sh" ]

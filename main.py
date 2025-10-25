@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from flasgger import Swagger
 import paramiko
 from flask import Response
+import os
+import traceback
 
 load_dotenv()
 
@@ -146,17 +148,34 @@ def create_pod():
         description: Created pod object
     """
     overrides = request.get_json(silent=True) or {}
+
     payload = {**DEFAULTS, **{k: v for k, v in overrides.items() if v is not None}}
+
+    # Inject templateId from env if present (preferred for private images)
+    template_id = os.getenv("TEMPLATE_ID")
+    if template_id:
+        payload["templateId"] = template_id
+        # Image name comes from template; safe to remove if present
+        payload.pop("imageName", None)
+
+    # Clean env in payload
     payload["env"] = {k: v for k, v in payload.get("env", {}).items() if v not in ("", None)}
-    if not payload.get("networkVolumeId"):
+
+    # Attach network volume if provided
+    if os.getenv("NETWORK_VOLUME_ID"):
+        payload["networkVolumeId"] = os.getenv("NETWORK_VOLUME_ID")
+        payload["volumeMountPath"] = os.getenv("VOLUME_MOUNT_PATH", "/workspace")
+    else:
         payload.pop("networkVolumeId", None)
 
     r = requests.post(f"{RUNPOD_BASE}/pods", headers=auth_headers(), json=payload, timeout=60)
     if r.status_code >= 400:
         return jsonify({"error": r.text, "status": r.status_code}), r.status_code
+
     pod = r.json()
     save_state(pod)
     return jsonify(pod), 200
+
 
 @app.get("/get-ssh-command")
 def get_ssh_command():
@@ -170,19 +189,12 @@ def get_ssh_command():
         return jsonify({"ready": False, "message": r.text}), r.status_code
     pod = r.json()
 
-    # Prefer proxy alias/username when available
     proxy_user = pod.get("sshUsername")
-    if not proxy_user:
-        hint = (pod.get("sshAlias") or pod.get("connectHint") or "")
-        if "@ssh.runpod.io" in hint:
-            proxy_user = hint.split("@")[0]
-
     if proxy_user:
         cmd = f"ssh {proxy_user}@ssh.runpod.io -i ~/.ssh/id_ed25519"
-        return jsonify({"ready": True, "podId": pod_id, "sshCommand": cmd}), 200
 
+        return jsonify({"ready": True, "podId": pod_id, "sshCommand": cmd, "mode": "proxy"}), 200
 
-    # Fallback: public IP + mapped port 22
     public_ip = pod.get("publicIp")
     pm = pod.get("portMappings") or {}
     ssh_port = pm.get("22") if isinstance(pm, dict) else next((m.get("publicPort") for m in pm if str(m.get("privatePort")) == "22"), None)
@@ -191,6 +203,25 @@ def get_ssh_command():
         return jsonify({"ready": True, "podId": pod_id, "sshCommand": cmd, "mode": "public-ip"}), 200
 
     return jsonify({"ready": False, "message": "SSH proxy username and public IP not ready, retry shortly"}), 409
+
+
+def ssh_exec_target(host, port, username, command_str, password=None):
+    key = None
+    if password is None:
+        key = paramiko.Ed25519Key.from_private_key_file(SSH_KEY_PATH)
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(host, port=port, username=username, pkey=key if password is None else None,
+                password=password, look_for_keys=False, allow_agent=False, timeout=20)
+    try:
+        _, stdout, stderr = cli.exec_command(command_str)
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        code = stdout.channel.recv_exit_status()
+        return {"exit": code, "stdout": out, "stderr": err}
+    finally:
+        cli.close()
+
 
 
 @app.get("/pods/count-running")
@@ -420,51 +451,49 @@ def start_stt():
       400:
         description: No state found
     """
-    # Load latest pod id from state
     st = load_state()
     if not st:
         return jsonify({"error": "No state found"}), 400
     pod_id = st.get("id") or st.get("podId") or st.get("pod", {}).get("id")
 
-    # Fetch pod for connection details
     r = requests.get(f"{RUNPOD_BASE}/pods/{pod_id}", headers=auth_headers(), timeout=30)
     if r.status_code >= 400:
         return jsonify({"error": r.text}), r.status_code
     pod = r.json()
 
-    ip = pod.get("publicIp")
-    pm = pod.get("portMappings") or {}
-    if isinstance(pm, dict):
-        ssh_port = pm.get("22")
+    proxy_user = pod.get("sshUsername")
+    if proxy_user:
+        host = "ssh.runpod.io"
+        port = 22
+        username = proxy_user
     else:
-        ssh_port = next((m.get("publicPort") for m in pm if str(m.get("privatePort")) == "22"), None)
-    if not ip or not ssh_port:
-        return jsonify({"ready": False, "message": "SSH not ready"}), 409
+        ip = pod.get("publicIp")
+        pm = pod.get("portMappings") or {}
+        port = pm.get("22") if isinstance(pm, dict) else next((m.get("publicPort") for m in pm if str(m.get("privatePort")) == "22"), None)
+        if not ip or not port:
+            return jsonify({"ready": False, "message": "SSH not ready"}), 409
+        host = ip
+        username = SSH_USER
 
-    # Build robust script to run remotely
     script = r"""#!/usr/bin/env bash
 set -euo pipefail
 
-# 1) Navigate to project
 cd /workspace || { echo 'CHECK:cd_workspace=fail'; exit 2; }
 echo 'CHECK:cd_workspace=ok'
 cd /workspace/hearmefinal || { echo 'CHECK:cd_hearmefinal=fail'; exit 3; }
 echo 'CHECK:cd_hearmefinal=ok'
 
-# 2) Verify venv exists
 if [ ! -x venv/bin/python3 ]; then
   echo 'CHECK:venv_missing=1'
   exit 10
 fi
 echo 'CHECK:venv_present=1'
 
-# 3) Prove we’re using venv python
 export VENV_PY="$(pwd)/venv/bin/python3"
 echo "CHECK:which_python=$($VENV_PY -c 'import sys; print(sys.executable)')"
 echo "CHECK:base_prefix=$($VENV_PY -c 'import sys; print(sys.base_prefix)')"
 echo "CHECK:prefix=$($VENV_PY -c 'import sys; print(sys.prefix)')"
 
-# 4) Start uvicorn in background and capture PID + logs
 mkdir -p /workspace/hearmefinal/logs
 nohup "$VENV_PY" -m uvicorn hearme.app:app \
   --host 0.0.0.0 --port 8000 \
@@ -478,16 +507,12 @@ echo 'CHECK:pid_file=/workspace/hearmefinal/logs/uvicorn.pid'
 echo 'CHECK:done=1'
 """
 
-    # Encode and execute as a single remote command to avoid quoting issues
-    import base64, json as _json
+    import base64
     b64 = base64.b64encode(script.encode()).decode()
-    # Use Python on the remote to decode and pipe to bash; avoids shell -c pitfalls
     remote_cmd = f"python3 - <<'PY'\nimport base64,subprocess\ns=base64.b64decode('{b64}').decode()\nsubprocess.run(['bash','-s'],input=s.encode())\nPY\n"
 
-    # IMPORTANT: pass a single command string to SSH so nothing is joined with '&&'
-    result = ssh_exec(ip, ssh_port, [remote_cmd])
+    result = ssh_exec_target(host, port, username, remote_cmd)
 
-    # Parse CHECK markers from stdout
     checks = {}
     for line in (result.get("stdout") or "").splitlines():
         if line.startswith("CHECK:") and "=" in line:
@@ -497,10 +522,10 @@ echo 'CHECK:done=1'
     return jsonify({
         "podId": pod_id,
         "ready": True,
+        "mode": "proxy" if proxy_user else "public-ip",
         "checks": checks,
         "result": result
     }), 200
-
 
 if __name__ == "__main__":
     # Basic sanity checks so it doesn’t exit silently
